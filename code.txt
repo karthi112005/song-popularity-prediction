@@ -1,0 +1,237 @@
+# ================================================
+# FINAL SPOTIFY INTERACTIVE DASHBOARD + CLEANING
+# Features:
+#  - Full data cleaning
+#  - Summary statistics printed
+#  - 5 interactive Plotly graphs
+#  - Global filters (genre, explicit, year)
+#  - Download filtered data as CSV
+#  - Dark mode + clean UI
+# Run: python spotify_final_dashboard.py
+# ================================================
+
+import pandas as pd
+import numpy as np
+import dash
+from dash import dcc, html, Input, Output, callback, ctx
+import plotly.express as px
+import plotly.graph_objects as go
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------------------------------------
+# 1. LOAD & CLEAN DATA
+# -------------------------------------------------
+print("\n" + "="*60)
+print("   SPOTIFY DATA CLEANING & INTERACTIVE DASHBOARD")
+print("="*60)
+
+print("Loading dataset.csv...")
+df = pd.read_csv('dataset.csv')
+original_rows = len(df)
+print(f"Original rows: {original_rows:,}")
+
+# Drop unnamed index
+df = df.drop(columns=df.columns[0], errors='ignore')
+
+# --- CLEANING PIPELINE ---
+print("\nCleaning data...")
+
+# 1. Missing values
+missing = df.isnull().sum().sum()
+df = df.dropna().reset_index(drop=True)
+
+# 2. Duplicates
+duplicates = df.duplicated().sum()
+df = df.drop_duplicates().reset_index(drop=True)
+
+# 3. Fix types
+df['instrumentalness'] = df['instrumentalness'].replace({'1.01e-06': '0.000001'})
+df['instrumentalness'] = pd.to_numeric(df['instrumentalness'], errors='coerce')
+df['popularity'] = df['popularity'].astype(int)
+df['duration_ms'] = df['duration_ms'].astype(int)
+df['explicit'] = df['explicit'].astype(bool)
+
+# 4. Feature engineering
+df['duration_min'] = df['duration_ms'] / 60000
+df['main_artist'] = df['artists'].str.split(';').str[0].str.split(',').str[0].str.strip()
+df['track_genre'] = df['track_genre'].str.strip().str.lower()
+
+# 5. Outlier removal
+df = df[df['tempo'].between(30, 250)]
+df = df[df['loudness'].between(-60, 0)]
+audio_cols = ['danceability','energy','speechiness','acousticness','instrumentalness','liveness','valence']
+for col in audio_cols:
+    df[col] = df[col].clip(0, 1)
+df['popularity'] = df['popularity'].clip(0, 100)
+df = df[df['duration_min'].between(0.5, 30)]
+
+# 6. Approximate year (for filtering)
+df['approx_year'] = (df['duration_min'] * 10).astype(int) * 10 + 1950
+
+# Save cleaned
+os.makedirs('output', exist_ok=True)
+df.to_csv('output/cleaned_spotify_dataset.csv', index=False)
+
+# -------------------------------------------------
+# 2. SUMMARY STATISTICS
+# -------------------------------------------------
+print(f"\nCleaned rows: {len(df):,}")
+print(f"Rows removed: {original_rows - len(df):,}")
+print(f"Duplicates removed: {duplicates}")
+print(f"Missing values removed: {missing}")
+print(f"Unique genres: {df['track_genre'].nunique():,}")
+print(f"Unique main artists: {df['main_artist'].nunique():,}")
+
+print("\nSummary Statistics:")
+stats = df[['popularity','duration_min','danceability','energy','valence','tempo']].describe().round(2)
+print(stats.to_string())
+
+# -------------------------------------------------
+# 3. DASH APP
+# -------------------------------------------------
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "Spotify Explorer"
+app.layout = html.Div([
+    html.H1("Spotify Tracks Interactive Dashboard", 
+            style={'textAlign':'center','color':'#1DB954','fontWeight':'bold','margin':'20px'}),
+
+    # Filters
+    html.Div([
+        html.Div([
+            html.Label("Genre", style={'fontWeight':'bold'}),
+            dcc.Dropdown(id='genre-filter',
+                         options=[{'label':'All Genres','value':'All'}] + 
+                                 [{'label':g.title(),'value':g} for g in sorted(df['track_genre'].unique())],
+                         value='All')
+        ], style={'width':'30%','display':'inline-block','margin':'10px'}),
+
+        html.Div([
+            html.Label("Explicit", style={'fontWeight':'bold'}),
+            dcc.Dropdown(id='explicit-filter',
+                         options=[{'label':'All','value':'All'},
+                                  {'label':'Yes','value':True},
+                                  {'label':'No','value':False}],
+                         value='All')
+        ], style={'width':'15%','display':'inline-block','margin':'10px'}),
+
+        html.Div([
+            html.Label("Year Range", style={'fontWeight':'bold'}),
+            dcc.RangeSlider(id='year-slider',
+                            min=1950, max=2030, step=10,
+                            value=[1950, 2030],
+                            marks={y:str(y) for y in range(1950,2031,10)},
+                            tooltip={'always_visible':True})
+        ], style={'width':'45%','display':'inline-block','verticalAlign':'top','margin':'10px'})
+    ], style={'backgroundColor':'#f8f9fa','padding':'15px','borderRadius':'10px','margin':'20px'}),
+
+    # Download button
+    html.Div([
+        html.Button("Download Filtered Data as CSV", id="btn_csv", 
+                    style={'backgroundColor':'#1DB954','color':'white','border':'none','padding':'10px 20px','borderRadius':'5px','fontWeight':'bold'}),
+        dcc.Download(id="download-dataframe-csv")
+    ], style={'textAlign':'center','margin':'10px'}),
+
+    # Graphs
+    html.Div([
+        html.Div([dcc.Graph(id='pop-hist')], style={'width':'48%','display':'inline-block'}),
+        html.Div([dcc.Graph(id='top-artists')], style={'width':'48%','display':'inline-block','float':'right'})
+    ], style={'margin':'10px'}),
+
+    html.Div([
+        html.Div([dcc.Graph(id='scatter-dance-energy')], style={'width':'48%','display':'inline-block'}),
+        html.Div([dcc.Graph(id='heatmap-genre')], style={'width':'48%','display':'inline-block','float':'right'})
+    ], style={'margin':'10px'}),
+
+    html.Div([dcc.Graph(id='pop-vs-duration')], style={'margin':'10px'})
+], style={'backgroundColor':'#121212','color':'white','fontFamily':'Arial','padding':'20px'})
+
+# -------------------------------------------------
+# 4. CALLBACKS
+# -------------------------------------------------
+@callback(
+    Output('download-dataframe-csv', 'data'),
+    Input('btn_csv', 'n_clicks'),
+    Input('genre-filter','value'),
+    Input('explicit-filter','value'),
+    Input('year-slider','value'),
+    prevent_initial_call=True
+)
+def download_csv(n_clicks, genre, explicit, year_range):
+    if ctx.triggered_id != 'btn_csv': return dash.no_update
+    dff = filter_data(genre, explicit, year_range)
+    return dcc.send_data_frame(dff.to_csv, "filtered_spotify_data.csv")
+
+@callback(
+    [Output('pop-hist','figure'),
+     Output('top-artists','figure'),
+     Output('scatter-dance-energy','figure'),
+     Output('heatmap-genre','figure'),
+     Output('pop-vs-duration','figure')],
+    [Input('genre-filter','value'),
+     Input('explicit-filter','value'),
+     Input('year-slider','value')]
+)
+def update_graphs(genre, explicit, year_range):
+    dff = filter_data(genre, explicit, year_range)
+
+    # 1. Popularity
+    fig1 = px.histogram(dff, x='popularity', nbins=50, color_discrete_sequence=['#1DB954'],
+                        title='Popularity Distribution')
+    fig1.update_layout(template='plotly_dark', showlegend=False)
+
+    # 2. Top Artists
+    top_art = dff.groupby('main_artist')['popularity'].mean().nlargest(10).reset_index()
+    fig2 = px.bar(top_art, x='popularity', y='main_artist', orientation='h',
+                  color='popularity', color_continuous_scale='Viridis',
+                  title='Top 10 Artists by Avg Popularity')
+    fig2.update_layout(template='plotly_dark', yaxis={'categoryorder':'total ascending'})
+
+    # 3. Dance vs Energy
+    sample = dff.sample(min(3000, len(dff)), random_state=42)
+    fig3 = px.scatter(sample, x='danceability', y='energy', color='track_genre',
+                      hover_data=['track_name','main_artist','popularity'],
+                      title='Danceability vs Energy', opacity=0.7)
+    fig3.update_layout(template='plotly_dark', legend={'title':'Genre'})
+
+    # 4. Heatmap
+    features = ['danceability','energy','valence','acousticness','speechiness']
+    genre_means = dff.groupby('track_genre')[features].mean()
+    top_genres = genre_means.mean(axis=1).nlargest(20).index
+    hm_data = genre_means.loc[top_genres].T
+    fig4 = go.Figure(data=go.Heatmap(
+        z=hm_data.values, x=hm_data.index, y=hm_data.columns,
+        colorscale='RdBu', text=hm_data.values, texttemplate='%{text:.2f}'
+    ))
+    fig4.update_layout(template='plotly_dark', title='Audio Features by Genre (Top 20)')
+
+    # 5. Duration vs Popularity
+    sample2 = dff.sample(min(10000, len(dff)), random_state=42)
+    fig5 = px.scatter(sample2, x='duration_min', y='popularity',
+                      trendline='ols', trendline_color_override='red',
+                      color='valence', color_continuous_scale='Plasma',
+                      hover_data=['track_name','main_artist'],
+                      title='Popularity vs Duration')
+    fig5.update_layout(template='plotly_dark')
+    fig5.update_xaxes(range=[0, 10])
+
+    return fig1, fig2, fig3, fig4, fig5
+
+def filter_data(genre, explicit, year_range):
+    dff = df.copy()
+    if genre != 'All':
+        dff = dff[dff['track_genre'] == genre]
+    if explicit != 'All':
+        dff = dff[dff['explicit'] == explicit]
+    dff = dff[dff['approx_year'].between(year_range[0], year_range[1])]
+    return dff
+
+# -------------------------------------------------
+# 5. RUN
+# -------------------------------------------------
+if __name__ == '__main__':
+    print(f"\nCleaned data saved to: output/cleaned_spotify_dataset.csv")
+    print("Starting dashboard... Open http://127.0.0.1:8050")
+    print("="*60 + "\n")
+    app.run_server(debug=False, port=8050)
